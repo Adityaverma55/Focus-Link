@@ -51,7 +51,9 @@ source .venv/bin/activate
 .\.venv\Scripts\activate.bat
 
 # On Windows (PowerShell):
-.\.venv\Scripts\Activate.ps1
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process (first-> use this)
+
+.\.venv\Scripts\Activate.ps1 (second -> use this)
 ```
 
 #### 4. Install Dependencies

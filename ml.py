@@ -8,7 +8,7 @@ import threading
 from collections import deque
 
 # ---------------- CONFIG ----------------
-CALIB_SECONDS = 3.0
+CALIB_SECONDS = 5.0
 EAR_BLINK_THRESHOLD = 0.18
 BLINK_CONSEC_FRAMES = 2
 FACE_DET_CONF = 0.45

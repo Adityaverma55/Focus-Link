@@ -1,4 +1,4 @@
-Python below 3.11
+#Python below 3.11
 opencv-python>=4.7.0
 mediapipe>=0.10.0
 numpy>=1.24.0
