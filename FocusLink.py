@@ -1,392 +1,557 @@
-# 4ml_fixed_timers.py
 import cv2
 import mediapipe as mp
 import numpy as np
-import sounddevice as sd
-import time
-import threading
+import math
+from ultralytics import YOLO
+from datetime import datetime
 from collections import deque
+import sounddevice as sd
+import sys
+import threading
+import time
 
-# ---------------- CONFIG ----------------
-CALIB_SECONDS = 5.0
-EAR_BLINK_THRESHOLD = 0.18
-BLINK_CONSEC_FRAMES = 2
-FACE_DET_CONF = 0.45
-EYE_VARIANCE_THRESHOLD = 200.0   # occlusion check: variance too low => likely covered
-EYE_MEAN_DARK = 45.0             # occlusion check: mean too dark => covered
-GAZE_X_DELTA = 0.07              # threshold around calibrated center for LEFT/RIGHT
-GAZE_Y_DELTA = 0.06              # threshold around calibrated center for UP/DOWN
-SCORE_SMOOTH = 6
-NOISE_SENSITIVITY = 2.0          # how much above baseline RMS counts as noise
-AUDIO_CALIB_SECONDS = 1.0
+# --- CONFIGURATION (Optimization Parameters) ---
+# Set this to a lower value (e.g., 320 or 480) for low-end PCs
+# Processing will happen on a downscaled frame, but display will be original size
+PROCESS_RESOLUTION_WIDTH = 640 
+MAX_FPS = 25 # Limit the main loop FPS to save CPU/GPU resources
+FRAME_SKIP_YOLO = 3 # Run YOLO on every Nth frame (YOLO is the most expensive part)
+
+# MediaPipe Face Mesh setup
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
+drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1, color=(0, 255, 0))
+# Initialize Face Mesh for up to 3 faces (max_num_faces=3 is fine)
+face_mesh = mp_face_mesh.FaceMesh(
+    max_num_faces=3,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5)
+
+# YOLOv8 setup - using the fast 'n' model is good
+yolo_model = YOLO('yolov8n.pt')
+# List of "distraction" objects YOLO can detect
+DISTRACTION_CLASSES = ['cell phone', 'book', 'laptop', 'mouse', 'remote', 'keyboard','pencil']
+
+# --- !!! THIS IS THE PART YOU MUST TUNE !!! ---
+# Concentration Logic Parameters
+EAR_THRESHOLD = 0.18
+HEAD_POSE_THRESHOLD = 30
+ROLLING_AVERAGE_FRAMES = 90
+
+# --- THIS IS THE "ADD-ON" FOR NOISE ---
+NOISE_SENSITIVITY = 2.0
+AUDIO_CALIB_SECONDS = 3.0
 AUDIO_SR = 22050
 AUDIO_BLOCKSIZE = 1024
-EYES_CLOSED_SECONDS = 3.0        # <-- display eyes closed if closed for this long
-NO_FACE_SECONDS = 10.0           # <-- exit if no face detected this many seconds
-# ----------------------------------------
 
-# MediaPipe
-mp_face_mesh = mp.solutions.face_mesh
-mp_face_detection = mp.solutions.face_detection
-mp_drawing = mp.solutions.drawing_utils
+# Threshold for counting a 'person' detection (Fix for 'hand as person' bug)
+PERSON_CONFIDENCE_THRESHOLD = 0.6 # (60% confidence)
 
-face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True, max_num_faces=1)
-face_detection = mp_face_detection.FaceDetection(min_detection_confidence=0.4)
 
-# landmark indices
-LEFT_EYE = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-LEFT_IRIS = 468
-RIGHT_IRIS = 473
+# --- DATA STORAGE ---
+person_concentration_history = {
+    0: deque(maxlen=ROLLING_AVERAGE_FRAMES),
+    1: deque(maxlen=ROLLING_AVERAGE_FRAMES),
+    2: deque(maxlen=ROLLING_AVERAGE_FRAMES)
+}
+person_total_concentration_frames = {0: 0, 1: 0, 2: 0}
+person_frame_count = {0: 0, 1: 0, 2: 0}
+total_frames = 0
+yolo_frame_counter = 0 # Counter for frame skipping
 
-# audio globals (thread-safe)
+# For Pillar 2: Distraction Logging
+distraction_log = []
+last_seen_distractions = set()
+# Cache YOLO results from the last run to use for skipped frames
+last_yolo_boxes = []
+
+# --- "ADD-ON" FOR NOISE (Thread-safe variables) ---
 _audio_rms = 0.0
 _audio_lock = threading.Lock()
 _audio_stream = None
-_audio_baseline = 1e-6
+_audio_baseline = 1e-6 
 
-def audio_callback(indata, frames, time_info, status):
-    global _audio_rms
-    mono = np.mean(indata, axis=1) if indata.ndim > 1 else indata[:,0]
-    rms = float(np.sqrt(np.mean(np.square(mono))))
-    with _audio_lock:
-        _audio_rms = rms
 
-def start_audio():
-    global _audio_stream
-    try:
-        _audio_stream = sd.InputStream(callback=audio_callback,
-                                        blocksize=AUDIO_BLOCKSIZE,
-                                        samplerate=AUDIO_SR,
-                                        channels=1)
-        _audio_stream.start()
-        return True
-    except Exception as e:
-        print("Audio stream start failed:", e)
-        return False
+# --- HELPER FUNCTIONS (PILLAR 1) ---
 
-def calibrate_audio_baseline():
-    global _audio_baseline
-    try:
-        print(f"Calibrating microphone for {AUDIO_CALIB_SECONDS:.1f}s — please be quiet...")
-        rec = sd.rec(int(AUDIO_CALIB_SECONDS * AUDIO_SR), samplerate=AUDIO_SR, channels=1, dtype='float64')
-        sd.wait()
-        mono = rec[:,0]
-        _audio_baseline = max(1e-6, float(np.sqrt(np.mean(np.square(mono)))))
-        print(f"Audio baseline RMS = {_audio_baseline:.6f}")
-    except Exception as e:
-        print("Audio calibration failed:", e)
-        _audio_baseline = 1e-6
+def get_ear(landmarks, eye_indices):
+    """Calculates the Eye Aspect Ratio (EAR) for a single eye."""
+    
+    # Extract coordinates directly from normalized MediaPipe landmarks
+    def dist(p1, p2):
+        return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
 
-# ---------- Helpers ----------
-def eye_aspect_ratio(landmarks, eye_indices, w, h):
-    try:
-        pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in eye_indices]
-        A = np.linalg.norm(np.array(pts[1]) - np.array(pts[5]))
-        B = np.linalg.norm(np.array(pts[2]) - np.array(pts[4]))
-        C = np.linalg.norm(np.array(pts[0]) - np.array(pts[3]))
-        if C <= 1e-6:
-            return 0.0
-        return (A + B) / (2.0 * C)
-    except Exception:
+    # Vertical landmarks - using indices 1, 2, 3 for vertical
+    # NOTE: The original code used 1, 2, 3, but the 6-point model (P1..P6) typically uses
+    # P2 and P6, and P3 and P5 for vertical. Let's stick to the original logic's indices
+    v1 = landmarks[eye_indices[1]]
+    v2 = landmarks[eye_indices[2]]
+    v3 = landmarks[eye_indices[3]]
+    # Horizontal landmarks
+    h1 = landmarks[eye_indices[0]]
+    h2 = landmarks[eye_indices[4]]
+    
+    # Calculate vertical and horizontal distances (using index 5 for the last point as per original logic)
+    vertical_dist1 = dist(v1, v3)
+    vertical_dist2 = dist(v2, landmarks[eye_indices[5]]) 
+    horizontal_dist = dist(h1, h2)
+    
+    if horizontal_dist == 0:
         return 0.0
 
-def eye_region_stats(gray, landmarks, eye_indices, w, h, pad=6):
-    xs = [int(landmarks[i].x * w) for i in eye_indices]
-    ys = [int(landmarks[i].y * h) for i in eye_indices]
-    x1 = max(min(xs) - pad, 0); x2 = min(max(xs) + pad, w-1)
-    y1 = max(min(ys) - pad, 0); y2 = min(max(ys) + pad, h-1)
-    if x2 <= x1 or y2 <= y1:
-        return None
-    region = gray[y1:y2, x1:x2]
-    if region.size == 0:
-        return None
-    return float(np.mean(region)), float(np.var(region))
+    # EAR formula
+    ear = (vertical_dist1 + vertical_dist2) / (2.0 * horizontal_dist)
+    return ear
 
-def get_iris_avg(landmarks):
-    try:
-        return (landmarks[LEFT_IRIS].x + landmarks[RIGHT_IRIS].x) / 2.0, \
-                (landmarks[LEFT_IRIS].y + landmarks[RIGHT_IRIS].y) / 2.0
-    except Exception:
-        return None, None
-
-def compute_concentration(gaze_ok, head_ok, blink_recent, occluded, noise_flag):
-    # weights (tunable): gaze 40%, head 30%, blink penalty 20%, noise 10%
-    gaze_score = 1.0 if gaze_ok else 0.0
-    head_score = 1.0 if head_ok else 0.0
-    blink_pen = 0.0 if not blink_recent else 0.5
-    noise_pen = 1.0 if noise_flag else 0.0
-    base = 0.4*gaze_score + 0.3*head_score + 0.2*(1.0 - blink_pen) + 0.1*(1.0 - noise_pen)
-    if occluded:
-        base *= 0.2
-    return int(np.clip(base * 100.0, 0, 100))
-
-# ---------- Start audio thread and calibrate ----------
-audio_ok = start_audio()
-if audio_ok:
-    calibrate_audio_baseline()
-else:
-    print("Warning: audio disabled; noise detection will be off.")
-
-# ---------- Camera and calibration ----------
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("ERROR: Cannot open camera. Close other apps or check device.")
-    raise SystemExit
-
-cv2.namedWindow("Concentration Tracker", cv2.WINDOW_NORMAL)
-print("Camera opened. Starting gaze calibration — look straight at the camera now.")
-
-calib_x = []
-calib_y = []
-calib_start = time.time()
-while time.time() - calib_start < CALIB_SECONDS:
-    ret, frame = cap.read()
-    if not ret:
-        continue
-    frame = cv2.flip(frame, 1)
-    h, w, _ = frame.shape
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    det = face_detection.process(rgb)
-    mesh = face_mesh.process(rgb)
-    if mesh.multi_face_landmarks and det.detections:
-        landmarks = mesh.multi_face_landmarks[0].landmark
-        avgx, avgy = get_iris_avg(landmarks)
-        if avgx is not None:
-            calib_x.append(avgx); calib_y.append(avgy)
-    cv2.putText(frame, "Calibrating gaze (keep eyes on camera)...", (20,40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-    cv2.imshow("Concentration Tracker", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        cap.release()
-        cv2.destroyAllWindows()
-        raise SystemExit
-
-if not calib_x:
-    print("Calibration failed: no face/iris detected. Retry with better lighting/position.")
-    cap.release()
-    cv2.destroyAllWindows()
-    raise SystemExit
-
-baseline_x = float(np.mean(calib_x))
-baseline_y = float(np.mean(calib_y))
-print(f"Calibration complete. Baseline iris center = ({baseline_x:.3f}, {baseline_y:.3f})")
-
-# ---------- Main variables ----------
-score_buf = deque(maxlen=SCORE_SMOOTH)
-frame_no = 0
-blink_frames = 0
-last_blink_time = 0.0
-BLINK_MIN_SEP = 0.35  # seconds between blink events
-
-# --- Timers we add (initialized here so they're in scope) ---
-eyes_closed_start = None
-no_face_start = None
-
-print("Tracker running. Press 'q' in the window to quit.")
-
-#Focus Tracking counters
-focused_frames = 0
-total_frames = 0
-
-# ---------- Main loop ----------
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Frame grab failed; exiting main loop.")
-        break
-
-    frame_no += 1
-    frame = cv2.flip(frame, 1)
-    h, w, _ = frame.shape
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    # face detection confidence and mesh
-    det = face_detection.process(rgb)
-    mesh = face_mesh.process(rgb)
-    face_conf = 0.0
-    if det.detections:
-        face_conf = max([d.score[0] for d in det.detections])
-
-    occluded = False
-    blink_event = False
-    gaze_dir = "UNKNOWN"
-    concentration = 0
-
-    if mesh.multi_face_landmarks and face_conf >= FACE_DET_CONF:
-        # Reset no-face timer since we have a face now
-        no_face_start = None
-
-        lm = mesh.multi_face_landmarks[0].landmark
-
-        # draw lightweight mesh
-        mp_drawing.draw_landmarks(frame, mesh.multi_face_landmarks[0], mp_face_mesh.FACEMESH_TESSELATION,
-                                    mp_drawing.DrawingSpec(color=(0,200,0), thickness=1, circle_radius=1),
-                                    mp_drawing.DrawingSpec(color=(0,150,255), thickness=1))
-
-        # EAR blink detection (temporal)
-        left_ear = eye_aspect_ratio(lm, LEFT_EYE, w, h)
-        right_ear = eye_aspect_ratio(lm, RIGHT_EYE, w, h)
-        avg_ear = (left_ear + right_ear) / 2.0
-
-        if avg_ear > 0 and avg_ear < EAR_BLINK_THRESHOLD:
-            blink_frames += 1
-        else:
-            if blink_frames >= BLINK_CONSEC_FRAMES:
-                now = time.time()
-                if now - last_blink_time > BLINK_MIN_SEP:
-                    blink_event = True
-                    last_blink_time = now
-            blink_frames = 0
-
-        # --- NEW: Eyes closed continuous timer (3 seconds) ---
-        if avg_ear > 0 and avg_ear < EAR_BLINK_THRESHOLD:
-            if eyes_closed_start is None:
-                eyes_closed_start = time.time()
-            # else: keep the start time
-            # we do not change detection logic, just show overlay when time passes threshold
-            if time.time() - eyes_closed_start >= EYES_CLOSED_SECONDS:
-                cv2.putText(frame, "EYES CLOSED > 3s", (20, 270),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        else:
-            eyes_closed_start = None
-
-        # Occlusion: check pixel stats inside eye regions
-        left_stats = eye_region_stats(gray, lm, LEFT_EYE, w, h)
-        right_stats = eye_region_stats(gray, lm, RIGHT_EYE, w, h)
-        if left_stats is None or right_stats is None:
-            occluded = True
-        else:
-            lmean, lvar = left_stats; rmean, rvar = right_stats
-            if (lvar < EYE_VARIANCE_THRESHOLD or lmean < EYE_MEAN_DARK) and \
-                (rvar < EYE_VARIANCE_THRESHOLD or rmean < EYE_MEAN_DARK):
-                occluded = True
-
-        # gaze using iris avg and calibrated baseline
-        avgx, avgy = get_iris_avg(lm)
-        if avgx is None:
-            gaze_dir = "UNKNOWN"
-        else:
-            dx = avgx - baseline_x
-            dy = avgy - baseline_y
-            # assign direction
-            if abs(dx) <= GAZE_X_DELTA and abs(dy) <= GAZE_Y_DELTA:
-                gaze_dir = "CENTER"
-            elif abs(dx) > abs(dy):
-                gaze_dir = "LEFT" if dx < 0 else "RIGHT"
-            else:
-                gaze_dir = "UP" if dy < 0 else "DOWN"
-
-        # head center heuristic (nose)
-        try:
-            nose = lm[1]
-            nose_x = nose.x; nose_y = nose.y
-            head_ok = (abs(nose_x - 0.5) < 0.22 and abs(nose_y - 0.5) < 0.18)
-        except Exception:
-            head_ok = False
-
-        # audio noise check (normalized)
-        with _audio_lock:
-            current_rms = _audio_rms
-        noise_flag = False
-        if _audio_baseline > 0 and current_rms > _audio_baseline * NOISE_SENSITIVITY:
-            noise_flag = True
-
-        # compute concentration
-        gaze_ok = (gaze_dir == "CENTER")
-        concentration = compute_concentration(gaze_ok, head_ok, blink_event, occluded, noise_flag)
-    else:
-        # no reliable face
-        concentration = 0
-        occluded = True
-        gaze_dir = "NO_FACE"
-        noise_flag = False
-
-        # --- NEW: Start/advance no-face timer; exit after threshold ---
-        if no_face_start is None:
-            no_face_start = time.time()
-        else:
-            elapsed_no_face = time.time() - no_face_start
-            # optional: draw countdown on frame so user knows
-            cv2.putText(frame, f"No face: {int(elapsed_no_face)}s/{int(NO_FACE_SECONDS)}s", (20, 270),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            if elapsed_no_face >= NO_FACE_SECONDS:
-                print(f"No face detected for {NO_FACE_SECONDS} seconds. Exiting...")
-                break
-
-    # Reset no_face_start if face is present (handled above at detection start)
-    # (nothing else to do here)
-
-    score_buf.append(concentration)
-    smooth_score = int(np.mean(score_buf)) if len(score_buf) > 0 else concentration
-
-    # status label priority
-    if not mesh.multi_face_landmarks or face_conf < FACE_DET_CONF:
-        status = "NO FACE"
-    elif occluded:
-        status = "OCCLUDED"
-    else:
-        # noisy has precedence if noise present
-        with _audio_lock:
-            curr = _audio_rms
-        noisy = (_audio_baseline > 0 and curr > _audio_baseline * NOISE_SENSITIVITY)
-        if noisy:
-            status = "NOISY"
-        elif blink_event:
-            status = "BLINK"
-        elif smooth_score < 55:
-            status = "DISTRACTED"
-        else:
-            status = "CONCENTRATED"
+def get_head_pose(face_landmarks, frame_shape):
+    """Estimates head pose (yaw, pitch, roll) from face landmarks."""
+    h, w = frame_shape
     
-    #Count Focus Frames
-    if status == "CONCENTRATED" :
-        focused_frames += 1
+    # 3D model points of a generic face
+    face_3d_model_points = np.array([
+        [0.0, 0.0, 0.0],      # Nose tip (1)
+        [0.0, -330.0, -65.0], # Chin (152)
+        [-225.0, 170.0, -135.0], # Left eye left corner (263)
+        [225.0, 170.0, -135.0],  # Right eye right corner (33)
+        [-150.0, -150.0, -125.0], # Left Mouth corner (287)
+        [150.0, -150.0, -125.0]  # Right mouth corner (57)
+    ])
+    
+    # Key 2D image points from MediaPipe - Use .x * w and .y * h for pixel coords
+    face_2d_image_points = np.array([
+        [face_landmarks.landmark[1].x * w, face_landmarks.landmark[1].y * h],     
+        [face_landmarks.landmark[152].x * w, face_landmarks.landmark[152].y * h], 
+        [face_landmarks.landmark[263].x * w, face_landmarks.landmark[263].y * h], 
+        [face_landmarks.landmark[33].x * w, face_landmarks.landmark[33].y * h],   
+        [face_landmarks.landmark[287].x * w, face_landmarks.landmark[287].y * h], 
+        [face_landmarks.landmark[57].x * w, face_landmarks.landmark[57].y * h]   
+    ], dtype=np.double)
+
+    # Camera matrix (approximatio) - using w as focal length is a common approximation
+    focal_length = w
+    cam_center = (w / 2, h / 2)
+    camera_matrix = np.array([
+        [focal_length, 0, cam_center[0]],
+        [0, focal_length, cam_center[1]],
+        [0, 0, 1]
+    ], dtype=np.double)
+    
+    # Assuming no lens distortion
+    dist_coeffs = np.zeros((4, 1), dtype=np.double)
+    
+    try:
+        # Solve for pose - cv2.SOLVEPNP_ITERATIVE is a good default
+        (success, rotation_vector, translation_vector) = cv2.solvePnP(
+            face_3d_model_points, face_2d_image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+        )
+        if not success:
+            return 0.0, 0.0, 0.0
+            
+        # Convert rotation vector to rotation matrix and then to Euler angles
+        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+        projection_matrix = np.hstack((rotation_matrix, translation_vector))
+        _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(projection_matrix)
+        
+        # Euler angles: yaw, pitch, roll
+        return -euler_angles[1][0], euler_angles[0][0], euler_angles[2][0]
+    except Exception:
+        # Silently fail, it happens when key points are obscured
+        return 0.0, 0.0, 0.0 
+
+
+# Eye landmark indices from MediaPipe Face Mesh
+LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
+
+
+# --- "ADD-ON" FOR NOISE (Helper Functions) ---
+def audio_callback(indata, frames, time_info, status):
+    """
+    This callback runs in a separate thread.
+    It safely updates the global RMS value.
+    """
+    global _audio_rms
+    if status:
+        print(status, file=sys.stderr)
+    
+    # Use float32 for RMS calculation
+    # Ensure indata is not empty or all zeros before calculation
+    if indata.size > 0:
+        rms = np.sqrt(np.mean(indata**2))
+        with _audio_lock:
+            _audio_rms = float(rms)
+
+def calibrate_audio_baseline():
+    """
+    Listens for a few seconds to find the average "silent"
+    noise level of the room.
+    """
+    global _audio_baseline
+    global cap 
+    try:
+        print(f"\nCalibrating microphone for {AUDIO_CALIB_SECONDS:.1f}s — PLEASE BE QUIET... (Press 'q' in window to skip)")
+        
+        # Need to open camera *before* calibration to check for 'q'
+        if not cap.isOpened():
+            cap.open(0)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+        rec_data = []
+        def rec_callback(indata, frames, time_info, status):
+            rec_data.append(indata.copy())
+            
+        rec_stream = sd.InputStream(
+            callback=rec_callback, 
+            samplerate=AUDIO_SR, 
+            blocksize=AUDIO_BLOCKSIZE, 
+            channels=1, 
+            dtype='float32'
+        )
+        
+        rec_stream.start()
+        
+        start_time = time.time()
+        while time.time() - start_time < AUDIO_CALIB_SECONDS:
+            ret, frame = cap.read()
+            if ret:
+                # Show a message on the calibration frame
+                frame = cv2.flip(frame, 1)
+                cv2.putText(frame, "CALIBRATING... PLEASE BE QUIET", (50, 360), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                cv2.imshow('Concentration and Distraction Analyzer', frame)
+            
+            if cv2.waitKey(5) & 0xFF == ord('q'):
+                print("Audio calibration skipped.")
+                break
+        
+        rec_stream.stop()
+        rec_stream.close()
+
+        if not rec_data:
+            print("Audio calibration failed: No data recorded.")
+            _audio_baseline = 1e-6 
+            return
+
+        # Calculate RMS of the entire recording
+        full_recording = np.concatenate(rec_data, axis=0)
+        # Handle stereo/mono if necessary, assuming one channel 'channels=1' was requested
+        mono = full_recording.flatten() 
+        _audio_baseline = max(1e-6, float(np.sqrt(np.mean(np.square(mono)))))
+        print(f"Audio baseline RMS = {_audio_baseline:.6f}")
+        
+    except Exception as e:
+        print(f"Audio calibration failed: {e}")
+        _audio_baseline = 1e-6 
+
+def start_audio_stream():
+    """
+    Starts the continuous, non-blocking audio stream for real-time analysis.
+    """
+    global _audio_stream
+    try:
+        # Check if default device exists before starting
+        sd.query_devices() 
+        _audio_stream = sd.InputStream(
+            callback=audio_callback,
+            samplerate=AUDIO_SR,
+            blocksize=AUDIO_BLOCKSIZE,
+            channels=1,
+            dtype='float32'
+        )
+        _audio_stream.start()
+        print("Real-time audio stream started.")
+        return True
+    except Exception as e:
+        print(f"Warning: Could not start audio stream. {e}")
+        print("Noise detection will be disabled.")
+        return False
+# --- END "ADD-ON" ---
+
+
+# --- MAIN PROGRAM ---
+print("Starting Concentration Tracker... Press 'q' to quit.")
+cap = cv2.VideoCapture(0)
+
+if not cap.isOpened():
+    print("Error: Cannot open webcam.")
+    sys.exit()
+
+# Try to set a standard high-res for better quality display, 
+# but we will downscale for processing later.
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+# --- Frame Rate Control Setup ---
+# Calculate the delay needed to not exceed MAX_FPS
+if MAX_FPS > 0:
+    target_frame_time_ms = 1000 / MAX_FPS
+else:
+    target_frame_time_ms = 0
+last_frame_time = time.time()
+
+# --- Optimization: Set OpenCV Preferred Backend (Optional but helpful) ---
+# Use DSHOW on Windows for better camera initialization, or AUTO.
+# cv2.setPreference(cv2.CAP_DSHOW) # Only uncomment on Windows if you have issues
+
+# --- "ADD-ON" FOR NOISE (Calibration) ---
+calibrate_audio_baseline()
+if not start_audio_stream():
+    _audio_stream = None 
+
+# --- MAIN LOOP ---
+while cap.isOpened():
+    frame_start_time = time.time()
+    
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Failed to grab frame.")
+        break
+        
     total_frames += 1
+    
+    # Flip the frame horizontally for a "mirror" view
+    frame = cv2.flip(frame, 1)
+    
+    # Get original dimensions for upscaling bounding boxes later
+    H, W = frame.shape[:2]
+    
+    # --- Optimization: Downscale for Processing ---
+    if W > PROCESS_RESOLUTION_WIDTH:
+        scale_factor = PROCESS_RESOLUTION_WIDTH / W
+        proc_frame = cv2.resize(frame, (PROCESS_RESOLUTION_WIDTH, int(H * scale_factor)))
+        p_H, p_W = proc_frame.shape[:2]
+    else:
+        scale_factor = 1.0
+        proc_frame = frame.copy()
+        p_H, p_W = H, W
+    
+    rgb_proc_frame = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
 
-    # Draw UI
-    bar_x, bar_y, bar_w, bar_h = 18, 22, 320, 30
-    fill = int((smooth_score/100.0) * bar_w)
-    color = (0,200,0) if smooth_score >= 60 else (0,140,255) if smooth_score >= 40 else (0,80,200)
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_h), (30,30,30), -1)
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x+fill, bar_y+bar_h), color, -1)
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_h), (200,200,200), 2)
-    cv2.putText(frame, f"{smooth_score}%", (bar_x+bar_w+10, bar_y+22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
-    cv2.putText(frame, f"Status: {status}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-    cv2.putText(frame, f"Gaze: {gaze_dir}", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-    if blink_event:
-        cv2.putText(frame, "BLINK", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
-    if noise_flag:
-        cv2.putText(frame, "NOISE", (20, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+    # --- PILLAR 2: ENVIRONMENT DETECTOR (YOLOv8) ---
+    # Optimization: Only run YOLO every N frames
+    yolo_frame_counter += 1
+    if yolo_frame_counter % FRAME_SKIP_YOLO == 0:
+        yolo_results = yolo_model(proc_frame, verbose=False)
+        last_yolo_boxes = yolo_results[0].boxes
+    
+    # Use the latest YOLO results (either fresh or cached)
+    current_distractions_in_frame = set()
+    num_persons_detected = 0 
 
-    cv2.putText(frame, f"Frame: {frame_no}", (20, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
+    for box in last_yolo_boxes:
+        class_id = int(box.cls[0])
+        class_name = yolo_model.names[class_id]
+        
+        # YOLO bounding boxes are based on proc_frame, so upscale them for the display frame
+        x1_p, y1_p, x2_p, y2_p = map(int, box.xyxy[0])
+        
+        # Upscale coordinates back to original frame size (W, H)
+        x1 = int(x1_p / scale_factor)
+        y1 = int(y1_p / scale_factor)
+        x2 = int(x2_p / scale_factor)
+        y2 = int(y2_p / scale_factor)
+        
+        confidence = float(box.conf[0])
+        
+        # Check for defined distraction classes
+        if class_name in DISTRACTION_CLASSES:
+            current_distractions_in_frame.add(class_name)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(frame, f"{class_name} ({confidence:.2f})", (x1, y1 - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        
+        # Count persons
+        elif class_name == 'person':
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            cv2.putText(frame, f"Person ({confidence:.2f})", (x1, y1 - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-    cv2.imshow("Concentration Tracker", frame)
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
+            if confidence > PERSON_CONFIDENCE_THRESHOLD:
+                num_persons_detected += 1
+    
+    # --- PILLAR 1: CONCENTRATION TRACKER (MediaPipe) ---
+    # MediaPipe runs on the downscaled frame for performance
+    rgb_proc_frame.flags.writeable = False 
+    mp_results = face_mesh.process(rgb_proc_frame)
+    rgb_proc_frame.flags.writeable = True
+
+    live_scores = {0: "N/A", 1: "N/A", 2: "N/A"}
+    num_faces_detected = 0
+
+    # --- "ADD-ON" FOR NOISE (Get current status) ---
+    with _audio_lock:
+        current_rms = _audio_rms
+    is_noisy = (current_rms > _audio_baseline * NOISE_SENSITIVITY)
+
+    if mp_results.multi_face_landmarks:
+        num_faces_detected = len(mp_results.multi_face_landmarks)
+        
+        for person_id, face_landmarks in enumerate(mp_results.multi_face_landmarks):
+            
+            # Upscale landmarks for drawing and head pose calculation (if scale_factor != 1.0)
+            # The landmarks are normalized (0 to 1), so we use the original (W, H) to get pixel values for drawing
+            face_landmarks_upscaled = face_landmarks
+            
+            # Draw the face mesh on the original frame
+            mp_drawing.draw_landmarks(
+                image=frame,
+                landmark_list=face_landmarks_upscaled, # MediaPipe handles the drawing using normalized coords
+                connections=mp_face_mesh.FACEMESH_TESSELATION,
+                landmark_drawing_spec=drawing_spec,
+                connection_drawing_spec=drawing_spec)
+
+            is_concentrating = False
+            try:
+                # Get head pose. Note: Head pose is calculated using the *downscaled* pixel coords
+                # inside the function, but since normalized landmarks are used, it's fine.
+                # The crucial part is using frame.shape[:2] which is the size the landmarks were normalized to
+                # (which is p_W, p_H from the proc_frame), so we pass that size.
+                yaw, pitch, roll = get_head_pose(face_landmarks, (p_H, p_W))
+                
+                # Check Eye Blinks
+                left_ear = get_ear(face_landmarks.landmark, LEFT_EYE_INDICES)
+                right_ear = get_ear(face_landmarks.landmark, RIGHT_EYE_INDICES)
+                ear = (left_ear + right_ear) / 2.0
+                
+                # Concentration Logic
+                head_forward = (abs(yaw) < HEAD_POSE_THRESHOLD) and (abs(pitch) < HEAD_POSE_THRESHOLD)
+                eyes_open = (ear > EAR_THRESHOLD)
+                
+                if head_forward and eyes_open and not is_noisy:
+                    is_concentrating = True
+
+                # Draw head pose info for debugging on the original frame
+                cv2.putText(frame, f"P{person_id+1} Yaw: {yaw:.0f}", (10, 90 + person_id*60), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(frame, f"P{person_id+1} Pitch: {pitch:.0f}", (10, 110 + person_id*60), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(frame, f"P{person_id+1} EAR: {ear:.2f}", (10, 130 + person_id*60), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            except Exception:
+                pass # solvePnP can sometimes fail
+
+            # Update concentration history
+            if is_concentrating:
+                person_concentration_history[person_id].append(1)
+                person_total_concentration_frames[person_id] += 1
+            else:
+                person_concentration_history[person_id].append(0)
+            
+            person_frame_count[person_id] += 1 
+
+            # Calculate live score
+            history = person_concentration_history[person_id]
+            if len(history) > 0:
+                live_score_perc = (sum(history) / len(history)) * 100
+                live_scores[person_id] = f"{live_score_perc:.0f}%"
+            else:
+                live_scores[person_id] = "..."
+                
+    # --- "THE MERGE": Correlate and Log ---
+
+    if num_persons_detected > num_faces_detected:
+        current_distractions_in_frame.add("other person")
+    
+    if is_noisy:
+        current_distractions_in_frame.add("Loud Noise")
+
+    # Log *newly* detected distractions
+    newly_detected_distractions = current_distractions_in_frame - last_seen_distractions
+    for obj_name in newly_detected_distractions:
+        event_time = datetime.now()
+        distraction_log.append((event_time, obj_name))
+        print(f"LOGGED Event: {event_time.strftime('%H:%M:%S')} - Detected {obj_name}")
+    
+    last_seen_distractions = current_distractions_in_frame
+
+
+    # --- DISPLAY FINAL FRAME ---
+    
+    # Display Pillar 1 Scores
+    cv2.putText(frame, f"P1 Score: {live_scores[0]}", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.putText(frame, f"P2 Score: {live_scores[1]}", (10, 60), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.putText(frame, f"P3 Score: {live_scores[2]}", (10, 90), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+    # Display Pillar 3 "Merge" Alert
+    distraction_alert_text = ""
+    if current_distractions_in_frame:
+        # Use only the top 3 distractions for display if there are many
+        display_distractions = list(current_distractions_in_frame)[:3] 
+        distraction_alert_text = "DISTRACTION: " + ", ".join(display_distractions)
+        
+    if distraction_alert_text:
+        # Position the text on the top right
+        text_size = cv2.getTextSize(distraction_alert_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0]
+        text_x = frame.shape[1] - text_size[0] - 10
+        cv2.putText(frame, distraction_alert_text, (text_x, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    # Correlate low score with distraction
+    for i in range(3):
+        score_val = live_scores[i]
+        if score_val != "N/A" and score_val != "..." and distraction_alert_text:
+            try:
+                if float(score_val[:-1]) < 50.0:
+                    cv2.putText(frame, f"Person {i+1} Distracted!", (10, H - 30 - (i*30)), # Moved text to bottom-left
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            except ValueError:
+                pass # Skip if score is "..."
+
+    cv2.imshow('Concentration and Distraction Analyzer', frame)
+
+    # --- Optimization: Frame Rate Control ---
+    # Calculate time taken for this frame
+    frame_end_time = time.time()
+    time_spent_ms = (frame_end_time - frame_start_time) * 1000
+    
+    # Calculate required delay
+    delay_ms = max(1, int(target_frame_time_ms - time_spent_ms)) 
+    
+    # Use the calculated delay in waitKey
+    if cv2.waitKey(delay_ms) & 0xFF == ord('q'):
         break
 
-# cleanup
-try:
-    if _audio_stream is not None:
-        _audio_stream.stop()
-        _audio_stream.close()
-except Exception:
-    pass
-
+# --- SHUTDOWN AND LOGGING ---
 cap.release()
+
+if _audio_stream:
+    _audio_stream.stop()
+    _audio_stream.close()
+    print("\nAudio stream stopped.")
+
 cv2.destroyAllWindows()
 
-# Show final focus summary
-if total_frames > 0:
-    focus_percent = (focused_frames / total_frames) * 100
-    print(f"\nSession Complete")
-    print(f"Total frames :{total_frames}")
-    print(f"Focused frames :{focused_frames}")
-    print(f"Average Concentration :{focus_percent:.2f}%\n")
-else:
-    print("No frames recorded.")
+print("\n" + "="*50)
+print("             PROGRAM ENDED - FINAL LOG")
+print("="*50)
 
-print("Exited cleanly.")
+# 1. Final Concentration Percentage Log
+print("\n--- FINAL CONCENTRATION LOG ---")
+if total_frames > 0:
+    for i in range(3):
+        if person_frame_count[i] > 0:
+            perc = (person_total_concentration_frames[i] / person_frame_count[i]) * 100
+            print(f"Person {i+1} Overall Concentration: {perc:.2f}%")
+        else:
+            print(f"Person {i+1} was not detected.")
+    print(f"\nTotal frames processed: {total_frames}")
+else:
+    print("No frames were processed.")
+
+# 2. Distraction Object Log
+print("\n--- DISTRACTION OBJECT LOG ---")
+if not distraction_log:
+    print("No distraction objects were detected during the session.")
+else:
+    print(f"Total distraction events logged: {len(distraction_log)}")
+    for event_time, obj_name in distraction_log:
+        print(f"[{event_time.strftime('%Y-%m-%d %H:%M:%S')}] Detected: {obj_name}")
+
+print("\n" + "="*50)
